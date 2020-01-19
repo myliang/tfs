@@ -11,7 +11,7 @@ plugins {
     id 'java-library'
 }
 
-group = 'com.github.myliang.wolf.tfs'
+group = 'wolf.tfs'
 version = '1.0'
 sourceCompatibility = 1.8
 
