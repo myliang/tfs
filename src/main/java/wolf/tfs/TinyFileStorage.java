@@ -2,51 +2,43 @@ package wolf.tfs;
 
 import org.hashids.Hashids;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.RandomAccessFile;
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
-import java.rmi.server.ExportException;
-import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
 
 public class TinyFileStorage {
 
-    static final int MB = 1024 * 1024;
-    static final int GB = 1024 * MB;
-    // 40M
-    static final int INIT_CAPACITY = 4 * 10 * MB;
-
     private Hashids hashids;
     private Builder builder;
-    private List<IndexNode> nodes = new ArrayList<>(INIT_CAPACITY);
+    private IndexNodes indexNodes;
 
-    // 当前数据文件的大小
-    private long dataSize = 0;
-    // 文件id
-    private byte dataFileId = 0;
-    private List<OutputStream> dataOutputs = new ArrayList<>();
+    private short dataFileId = -1;
+    private FileChannel dataWriteChannel;
+    private Map<Short, FileChannel> dataReadChannels = new HashMap<>();
 
-    private OutputStream ios;
+    private FileChannel indexWriteChannel;
 
     public TinyFileStorage(Builder builder) {
         this.builder = builder;
         this.hashids = new Hashids(builder.salt, 12);
+        this.indexNodes = new IndexNodes(builder.dataMaxSize, builder.averageSize);
+
         Path idx = builder.indexFilePath();
         try {
             if (!Files.exists(idx)) {
                 Files.createFile(idx);
             }
-            ios = Files.newOutputStream(idx, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            indexWriteChannel = FileChannel.open(idx, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
             InputStream is = Files.newInputStream(idx);
             byte[] bytes = new byte[IndexNode.BYTE_SIZE];
             for (;;) {
@@ -55,15 +47,14 @@ public class TinyFileStorage {
                     read = is.read(bytes, 0, bytes.length);
                     if (read < 0) break;
                     if (read == bytes.length) {
-                        IndexNode node = IndexNode.decode(bytes);
-                        nodes.add(node);
-                        dataSize += node.getSize();
+                        indexNodes.add(bytes);
                     }
                 } catch (IOException e) {
                     e.printStackTrace();
                     break;
                 }
             }
+            is.close();
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -73,24 +64,17 @@ public class TinyFileStorage {
         byte[] bytes = Files.readAllBytes(path);
 
         synchronized (this) {
-            // cal dataFileId
-            if (dataSize > builder.dataMaxSize) {
-                dataFileId++;
-            }
+            // first
+            IndexNode node = indexNodes.add(bytes.length);
 
-            // write the data file
-            OutputStream dos = getDataOutputStream();
-            dos.write(bytes, 0, bytes.length);
-            dos.flush();
+            // second: write the data file
+            FileChannel dfc = getDataWriteChannel();
+            dfc.write(ByteBuffer.wrap(bytes));
 
-            // update nodes & the idx file
-            IndexNode node = new IndexNode(dataFileId, dataSize, bytes.length);
-            nodes.add(node);
-            ios.write(node.encode());
-            ios.flush();
+            // write index to file
+            indexWriteChannel.write(node.encode());
 
-            dataSize += bytes.length;
-            return hashids.encode(dataFileId, nodes.size() - 1);
+            return hashids.encode(indexNodes.fid(), indexNodes.nid());
         }
     }
 
@@ -98,41 +82,98 @@ public class TinyFileStorage {
         long[] ids = hashids.decode(url);
         short fid = (short) ids[0];
         int nid = (int) ids[1];
-        if (nodes.contains(nid)) throw new RuntimeException("url error!");
-        IndexNode node = nodes.get(nid);
-        byte[] bytes = new byte[node.getSize()];
+        IndexNode node = indexNodes.get(fid, nid);
+        if (node == null) throw new RuntimeException("url error!");
 
-        RandomAccessFile rcf = new RandomAccessFile(builder.dataFilePath(fid).toFile(), "r");
-        rcf.seek(node.getOffset());
-        rcf.read(bytes, 0, node.getSize());
-        rcf.close();
+        byte[] bytes = new byte[node.getSize()];
+        FileChannel dfc = getDataReadChannel(fid);
+        MappedByteBuffer mbb = dfc.map(FileChannel.MapMode.READ_ONLY, node.getOffset(), node.getSize());
+        mbb.get(bytes);
         return bytes;
     }
 
-    private OutputStream getDataOutputStream() throws IOException {
-        if (!dataOutputs.contains(dataFileId)) {
-            dataOutputs.add(Files.newOutputStream(builder.dataFilePath(dataFileId), StandardOpenOption.CREATE, StandardOpenOption.APPEND));
+    public void close() {
+        this.closeIndexWriteChannel();
+        this.closeDataWriteChannel();
+        dataReadChannels.forEach((fid, it) -> {
+            try {
+                it.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        });
+    }
+
+    private void closeIndexWriteChannel() {
+        try {
+            indexWriteChannel.force(true);
+            indexWriteChannel.close();
+        } catch (IOException e) {
+            e.printStackTrace();
         }
-        return dataOutputs.get(dataFileId);
+    }
+
+    private void closeDataWriteChannel() {
+        try {
+            if (dataWriteChannel != null) {
+                dataWriteChannel.force(true);
+                dataWriteChannel.close();
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private synchronized FileChannel getDataWriteChannel() throws IOException {
+        short fid = indexNodes.fid();
+        if (dataFileId < fid) {
+            if (dataWriteChannel != null) {
+                closeDataWriteChannel();
+            }
+            dataWriteChannel = FileChannel.open(builder.dataFilePath(fid),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            dataFileId = fid;
+        }
+        return dataWriteChannel;
+    }
+
+    private FileChannel getDataReadChannel(short fid) throws IOException {
+        if (!dataReadChannels.containsKey(fid)) {
+            synchronized (this) {
+                if (!dataReadChannels.containsKey(fid)) {
+                    dataReadChannels.put(fid, FileChannel.open(builder.dataFilePath(fid),
+                            StandardOpenOption.READ));
+                }
+            }
+        }
+        return dataReadChannels.get(fid);
     }
 
     public static final class Builder {
         // the file storage directory
         String mount;
         String dataFileNamePrefix;
-        // the file size: Gb
+        // the file size: byte
         long dataMaxSize;
+        // byte
+        int averageSize;
         String salt;
 
         public Builder(String mount) {
             this.mount = mount;
-            this.dataFileNamePrefix = "_";
-            this.dataMaxSize = 100L * GB; // 100G
+            this.dataFileNamePrefix = "";
+            this.dataMaxSize = 100L * Constant.GB; // 100G
+            this.averageSize = Constant.MB; // 1M
             this.salt = "wolf-tiny-file-storage";
         }
 
-        public Builder dataMaxSize(int size) {
+        public Builder dataMaxSize(long size) {
             this.dataMaxSize = size;
+            return this;
+        }
+
+        public Builder averageSize(int size) {
+            this.averageSize = size;
             return this;
         }
 
@@ -150,7 +191,7 @@ public class TinyFileStorage {
             return Paths.get(mount, "_.tx");
         }
         public Path dataFilePath(short id) {
-            return Paths.get(mount, dataFileNamePrefix + id + ".td");
+            return Paths.get(mount, dataFileNamePrefix + "_" + id + ".td");
         }
 
         public TinyFileStorage build() {

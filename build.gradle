@@ -11,7 +11,7 @@ plugins {
     id 'java-library'
 }
 
-group = 'wolf.wolf.tfs'
+group = 'wolf.tfs'
 version = '1.0'
 sourceCompatibility = 1.8
 
@@ -23,6 +23,7 @@ repositories {
 
 dependencies {
     implementation 'org.hashids:hashids:1.0.3'
+    // implementation 'org.apache.lucene:lucene-core:8.0.0'
     // Use JUnit test framework
     testImplementation 'junit:junit:4.12'
 }

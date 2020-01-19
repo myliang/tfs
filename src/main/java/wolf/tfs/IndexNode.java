@@ -19,23 +19,21 @@ public class IndexNode {
 
     public IndexNode() {}
 
-    public IndexNode(byte fid, long offset, int size) {
+    public IndexNode(short fid, long offset, int size) {
         this.fid = fid;
         this.offset = offset;
         this.size = size;
         this.state = 0;
     }
 
-    public byte[] encode() {
+    public ByteBuffer encode() {
         ByteBuffer buffer = ByteBuffer.allocate(BYTE_SIZE);
         buffer.putShort(fid);
         buffer.putLong(offset);
         buffer.putInt(size);
         buffer.putShort(state);
         buffer.flip();
-        byte[] result = new byte[buffer.remaining()];
-        buffer.get(result);
-        return result;
+        return buffer;
     }
 
     public static IndexNode decode(byte[] bytes) {
