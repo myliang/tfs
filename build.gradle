@@ -11,7 +11,7 @@ plugins {
     id 'java-library'
 }
 
-group = 'wolf.tfs'
+group = 'com.github.myliang.wolf.tfs'
 version = '1.0'
 sourceCompatibility = 1.8
 
@@ -26,4 +26,23 @@ dependencies {
     // implementation 'org.apache.lucene:lucene-core:8.0.0'
     // Use JUnit test framework
     testImplementation 'junit:junit:4.12'
+}
+
+apply plugin: 'maven-publish'
+
+task sourcesJar (type:Jar) {
+    archiveClassifier = 'sources'
+}
+jar.dependsOn(sourcesJar)
+// publishing
+publishing {
+    repositories {
+        maven {
+            url "https://oss.sonatype.org/content/repositories/snapshots"
+            credentials {
+                username = 'myliang'
+                password = 'xx'
+            }
+        }
+    }
 }
